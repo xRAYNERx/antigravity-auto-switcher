@@ -1,0 +1,20 @@
+# build output
+dist/
+INSTALL/
+*.zip
+
+# runtime data
+panel.log
+panel.pid
+updated.flag
+cache/
+update/
+
+# screenshots generator output
+docs/shots/
+
+# editor / os
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
