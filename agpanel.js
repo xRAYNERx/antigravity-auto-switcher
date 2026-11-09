@@ -54,6 +54,7 @@ const state = {
   updateProgress: 0,
   updateError: '',
   imageQuota: null,
+  switchedAt: 0,
 };
 
 let cdp = null;
@@ -61,6 +62,8 @@ let cdpUrl = null;
 let injecting = false;
 let busy = false;
 let lastSwitchAt = 0;
+let imageQuotas = {};   // email -> { model, reset, at, dismissedAt }
+let legacyQuota = null; // old single-account image_quota.json, bound to the active account later
 
 // ---------------------------------------------------------------------------
 // logging
@@ -93,18 +96,54 @@ function loadCache() {
   return c;
 }
 
-function loadImageQuota() {
-  const q = readJson(IMAGE_QUOTA_FILE, null);
-  if (!q || !q.reset) return null;
-  if (Date.parse(q.reset) <= Date.now()) return null;
-  return q;
+function loadImageQuotas() {
+  const raw = readJson(IMAGE_QUOTA_FILE, null);
+  const out = {};
+  if (raw && raw.accounts && typeof raw.accounts === 'object') {
+    for (const email of Object.keys(raw.accounts)) {
+      const q = raw.accounts[email];
+      if (q && q.reset) out[email] = q;
+    }
+  } else if (raw && raw.reset) {
+    legacyQuota = raw; // account unknown: bind to the active one on first use
+  }
+  return out;
 }
 
-function saveImageQuota(q) {
+function saveImageQuotas() {
   try {
-    if (q) writeJson(IMAGE_QUOTA_FILE, q);
+    const accounts = {};
+    for (const email of Object.keys(imageQuotas)) accounts[email] = imageQuotas[email];
+    if (Object.keys(accounts).length) writeJson(IMAGE_QUOTA_FILE, { accounts: accounts });
     else if (fs.existsSync(IMAGE_QUOTA_FILE)) fs.unlinkSync(IMAGE_QUOTA_FILE);
   } catch (e) { /* ignore */ }
+}
+
+/** Drop entries whose window ended long ago, so an old one never nags on start. */
+function pruneImageQuotas() {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  let changed = false;
+  for (const email of Object.keys(imageQuotas)) {
+    if (Date.parse(imageQuotas[email].reset) < cutoff) {
+      delete imageQuotas[email];
+      changed = true;
+    }
+  }
+  if (changed) saveImageQuotas();
+}
+
+/** Quota entry for the account Antigravity is currently signed into. */
+function activeQuota() {
+  const email = state.active;
+  if (!email) return null;
+  if (!imageQuotas[email] && legacyQuota) {
+    imageQuotas[email] = legacyQuota;
+    legacyQuota = null;
+    saveImageQuotas();
+  }
+  const q = imageQuotas[email];
+  if (!q || !q.reset || q.dismissedAt) return null;
+  return { model: q.model || '', reset: q.reset };
 }
 
 function saveCache(c) {
@@ -786,6 +825,7 @@ async function ensureConsent() {
 
 async function pushState() {
   if (!cdp || cdp.closed) return;
+  state.imageQuota = activeQuota();
   try {
     await evaluate('window.__agSwitcher && window.__agSwitcher.update(' + JSON.stringify(state) + ')');
   } catch (e) { /* ignore */ }
@@ -840,9 +880,39 @@ async function handleCommand(raw) {
   } else if (msg.cmd === 'imageQuota') {
     const reset = String(msg.reset || '');
     if (!reset || Date.parse(reset) <= Date.now()) return;
-    state.imageQuota = { model: String(msg.model || ''), reset: reset, at: Date.now() };
-    saveImageQuota(state.imageQuota);
-    log('image quota exhausted for', state.imageQuota.model, 'until', reset);
+    const email = state.active;
+    if (!email) return;
+    // the same chat message is still on screen after an account switch:
+    // never credit it to the account that was just signed in
+    for (const other of Object.keys(imageQuotas)) {
+      if (other !== email && imageQuotas[other].reset === reset) return;
+    }
+    const prev = imageQuotas[email];
+    const same = prev && prev.reset === reset;
+    imageQuotas[email] = {
+      model: String(msg.model || ''),
+      reset: reset,
+      at: Date.now(),
+      dismissedAt: same ? (prev.dismissedAt || 0) : 0,
+    };
+    saveImageQuotas();
+    log('image quota exhausted for', imageQuotas[email].model, 'account', email, 'until', reset);
+    await pushState();
+  } else if (msg.cmd === 'quotaDismiss' || msg.cmd === 'quotaClear') {
+    const email = state.active;
+    if (!email) return;
+    const q = imageQuotas[email];
+    if (msg.cmd === 'quotaClear') {
+      if (q && (!msg.reset || String(msg.reset) === q.reset)) {
+        delete imageQuotas[email];
+        saveImageQuotas();
+        log('image quota notice cleared', email);
+      }
+    } else if (q && (!msg.reset || String(msg.reset) === q.reset)) {
+      q.dismissedAt = Date.now();
+      saveImageQuotas();
+      log('image quota notice dismissed', email);
+    }
     await pushState();
   }
 }
@@ -909,6 +979,7 @@ async function doSwitch(email, auto) {
       log('switch timeout');
     } else {
       state.active = email;
+      state.switchedAt = Date.now();
       lastSwitchAt = Date.now();
       log('switched to', email);
       await buildStateBase();
@@ -935,8 +1006,7 @@ async function doSwitch(email, auto) {
 async function refreshAll() {
   if (busy) return;
   if (state.imageQuota && Date.parse(state.imageQuota.reset) <= Date.now()) {
-    state.imageQuota = null;
-    saveImageQuota(null);
+    pruneImageQuotas();
     await pushState();
   }
   try {
@@ -1029,7 +1099,8 @@ async function main() {
   });
 
   log('daemon start');
-  state.imageQuota = loadImageQuota();
+  imageQuotas = loadImageQuotas();
+  pruneImageQuotas();
   await tick();
 
   // after a self-update the window still runs the old UI; reload it once

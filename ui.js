@@ -111,6 +111,15 @@
     '.qbar.show{display:flex}',
     '.qbar b{color:var(--agp-fg);font-weight:600}',
     '.qbar .qi{flex:0 0 auto;font-size:13px;line-height:1;opacity:.85}',
+    '.qbar .qt{flex:1;min-width:0}',
+    '.qbar .qx{flex:0 0 auto;border:0;background:transparent;color:var(--agp-muted);font-size:13px;',
+    ' line-height:1;cursor:pointer;padding:2px 5px;border-radius:5px}',
+    '.qbar .qx:hover{color:var(--agp-fg);background:var(--agp-hover)}',
+    '.qbar.ok{background:color-mix(in srgb, #50FA7B 10%, transparent);',
+    ' border-bottom-color:color-mix(in srgb, #50FA7B 32%, transparent)}',
+    '.qbar.ok .qt{color:color-mix(in srgb, #50FA7B 78%, var(--agp-fg))}',
+    '.qbar.ok .qx{color:#50FA7B;font-size:14px}',
+    '.qbar.ok .qx:hover{color:#50FA7B;background:color-mix(in srgb, #50FA7B 16%, transparent)}',
     '.sortbtn{display:flex;align-items:center;gap:3px;height:21px;padding:0 6px;border-radius:6px;',
     ' border:1px solid var(--agp-border);background:transparent;color:var(--agp-muted);font-size:10px;cursor:pointer}',
     '.sortbtn:hover{color:var(--agp-fg);background:var(--agp-hover)}',
@@ -231,7 +240,8 @@
     '<rect x="1.5" y="2.5" width="13" height="11" rx="2"/>' +
     '<circle cx="5.4" cy="6.2" r="1.1"/>' +
     '<path d="M2.6 11.6l3.4-3.1 2.5 2.2 2.3-1.9 2.6 2.4"/></svg>' +
-    '<span id="qt"></span>';
+    '<span class="qt" id="qt"></span>' +
+    '<button class="qx" id="qc" title="Скрыть">✕</button>';
 
   var list = document.createElement('div');
   list.className = 'list';
@@ -432,21 +442,64 @@
       updateBar.classList.remove('show');
     }
 
-    var qt = root.getElementById('qt');
+    renderQuotaBar();
+  }
+
+  var quotaMode = 'active';
+  var quotaLastText = '';
+
+  function renderQuotaBar() {
     var iq = current.imageQuota;
-    if (iq && iq.reset && Date.parse(iq.reset) > Date.now()) {
-      quotaBar.classList.add('show');
-      var leftMin = Math.max(0, Math.round((Date.parse(iq.reset) - Date.now()) / 60000));
-      var hh = Math.floor(leftMin / 60);
-      var mm = leftMin % 60;
-      var leftTxt = hh > 0 ? hh + 'ч' + (mm ? ' ' + mm + 'м' : '') : mm + 'м';
-      var d = new Date(iq.reset);
+    var qt = root.getElementById('qt');
+    var qc = root.getElementById('qc');
+    var t = iq && iq.reset ? Date.parse(iq.reset) : NaN;
+    if (!iq || !isFinite(t)) {
+      quotaBar.classList.remove('show', 'ok');
+      quotaLastText = '';
+      return;
+    }
+    var leftMs = t - Date.now();
+    var text;
+    if (leftMs > 0) {
+      if (quotaMode !== 'active') { quotaMode = 'active'; quotaBar.classList.remove('ok'); }
+      var leftMin = Math.max(0, Math.round(leftMs / 60000));
+      var leftTxt;
+      if (leftMin >= 1) {
+        var hh = Math.floor(leftMin / 60);
+        var mm = leftMin % 60;
+        leftTxt = hh > 0 ? hh + 'ч' + (mm ? ' ' + mm + 'м' : '') : mm + 'м';
+      } else {
+        leftTxt = Math.max(1, Math.round(leftMs / 1000)) + 'с';
+      }
+      var d = new Date(t);
       var clock = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
-      qt.innerHTML = 'Картинки: лимит исчерпан · восстановится через <b>' + leftTxt + '</b> (' + clock + ')';
+      text = 'Картинки: лимит исчерпан · восстановится через <b>' + leftTxt + '</b> (' + clock + ')';
+      qc.textContent = '✕';
+      qc.title = 'Скрыть';
     } else {
-      quotaBar.classList.remove('show');
+      if (quotaMode !== 'ok') { quotaMode = 'ok'; quotaBar.classList.add('ok'); }
+      text = '<b>Квота на картинки восстановлена</b>';
+      qc.textContent = '✓';
+      qc.title = 'Убрать';
+    }
+    quotaBar.classList.add('show');
+    if (text !== quotaLastText) {
+      quotaLastText = text;
+      qt.innerHTML = text;
     }
   }
+
+  root.getElementById('qc').addEventListener('click', function () {
+    var iq = current.imageQuota;
+    if (!iq || !iq.reset) return;
+    send({ cmd: quotaMode === 'ok' ? 'quotaClear' : 'quotaDismiss', reset: iq.reset });
+    current.imageQuota = null;
+    renderQuotaBar();
+  });
+
+  setInterval(function () {
+    if (current.imageQuota) renderQuotaBar();
+  }, 1000);
 
   function update(next) {
     current = next || current;
@@ -672,6 +725,12 @@
     // page can see. So watch the rendered chat, including messages from before
     // the panel was injected.
     var domTimer = 0;
+    // right after an account switch the old account's chat is still on screen,
+    // so its "quota exhausted" message must not be attributed to the new one
+    function switchedRecently() {
+      var t = current && current.switchedAt;
+      return !!(t && Date.now() - t < 180000);
+    }
     function scanPageText() {
       try {
         var q = parseQuotaText(document.body ? document.body.innerText : '');
@@ -687,8 +746,12 @@
         childList: true, subtree: true, characterData: true
       });
     } catch (e) { /* ignore */ }
-    setTimeout(scanPageText, 2000);
-    setTimeout(scanPageText, 7000);
+    setTimeout(function () {
+      if (!switchedRecently()) scanPageText();
+    }, 2000);
+    setTimeout(function () {
+      if (!switchedRecently()) scanPageText();
+    }, 7000);
   })();
 
   send({ cmd: 'hello' });
