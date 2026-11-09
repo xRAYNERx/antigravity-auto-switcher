@@ -538,19 +538,78 @@
     if (window.__agQuotaHooks) return;
     window.__agQuotaHooks = true;
 
-    function scan(txt) {
-      if (!txt || txt.indexOf('quotaResetTimeStamp') === -1) return;
-      var re = /"metadata"\s*:\s*\{[^}]*\}/g;
+    var lastHitKey = '';
+
+    function reportHit(model, reset) {
+      var t = Date.parse(reset);
+      if (!isFinite(t) || t <= Date.now()) return;
+      var iso = new Date(t).toISOString();
+      var key = model + '|' + iso;
+      if (key === lastHitKey) return;
+      lastHitKey = key;
+      try { window.__agSwitcherQuotaHit(model, iso); } catch (e) { /* ignore */ }
+    }
+
+    function clockToIso(hh, mm, tzOffsetHours) {
+      var d = new Date();
+      d.setUTCHours(parseInt(hh, 10) - (tzOffsetHours || 0), parseInt(mm, 10), 0, 0);
+      // reset crossed midnight UTC (e.g. now 23:50, reset 00:10)
+      if (d.getTime() - Date.now() < -12 * 3600 * 1000) d.setUTCDate(d.getUTCDate() + 1);
+      return d.getTime() > Date.now() ? d.toISOString() : '';
+    }
+
+    function resetFromText(txt) {
+      var m = txt.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(?:UTC|GMT)/i);
+      if (m) return clockToIso(m[1], m[2], 0);
+      m = txt.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*по\s*(?:МСК|MSK)/i);
+      if (m) return clockToIso(m[1], m[2], 3);
+      m = txt.match(/(?:через|in|after)\s*(?:(\d+)\s*(?:час\w*|ч\.?|hours?|hrs?|h)\s*)?(?:(\d+)\s*(?:мин\w*|min\w*|м\.?|m)\s*)?/i);
+      if (m && (m[1] || m[2])) {
+        var mins = (m[1] ? parseInt(m[1], 10) * 60 : 0) + (m[2] ? parseInt(m[2], 10) : 0);
+        if (mins > 0) return new Date(Date.now() + mins * 60000).toISOString();
+      }
+      return '';
+    }
+
+    /** Message the model wrote into chat after the image API said "quota exhausted". */
+    function parseQuotaText(txt) {
+      if (!txt) return null;
+      var re = /resource[_\s-]*exhausted|ошибка\s*429|error\s*(?:code\s*)?429|исчерпан\w*\s+(?:лимит|квот)|exhausted (?:your )?capacity|quota will reset|превышен\w*\s+(?:лимит|квот)/ig;
+      var m;
+      var guard = 0;
+      while ((m = re.exec(txt)) && guard++ < 40) {
+        var i = m.index;
+        var seg = txt.slice(Math.max(0, i - 600), i + 1600);
+        if (!/image|imagen|картин|изображен/i.test(seg)) continue;
+        var model = (seg.match(/gemini-[a-z0-9.\-]*image[a-z0-9.\-]*/i) || [])[0] || 'image';
+        var reset = resetFromText(seg);
+        if (reset) return { model: model, reset: reset };
+      }
+      return null;
+    }
+
+    function scanJson(txt) {
+      var re = /"quotaResetTimeStamp"\s*:\s*"([^"]+)"/g;
       var m;
       while ((m = re.exec(txt))) {
-        var block = m[0];
-        var model = (block.match(/"model"\s*:\s*"([^"]+)"/) || [])[1] || '';
-        var reset = (block.match(/"quotaResetTimeStamp"\s*:\s*"([^"]+)"/) || [])[1] || '';
-        if (model && reset && /image/i.test(model)) {
-          try { window.__agSwitcherQuotaHit(model, reset); } catch (e) { /* ignore */ }
-        }
+        var around = txt.slice(Math.max(0, m.index - 800), m.index + 100);
+        if (!/image/i.test(around)) continue;
+        var model = (around.match(/"model"\s*:\s*"([^"]+)"/) || [])[1] ||
+          (around.match(/gemini-[a-z0-9.\-]*image[a-z0-9.\-]*/i) || [])[0] || 'image';
+        reportHit(model, m[1]);
       }
     }
+
+    function scan(txt) {
+      if (!txt) return;
+      if (txt.indexOf('quotaResetTimeStamp') !== -1) scanJson(txt);
+      if (/exhaust|429|исчерпан/i.test(txt)) {
+        var q = parseQuotaText(txt);
+        if (q) reportHit(q.model, q.reset);
+      }
+    }
+
+    window.__agParseQuotaText = parseQuotaText;
 
     var origFetch = window.fetch;
     if (origFetch) {
@@ -607,6 +666,29 @@
       });
       window.WebSocket = PatchedWS;
     }
+
+    // The chat text is the only reliable signal: Antigravity reports the dead
+    // image quota in the assistant's own message, not in an API response the
+    // page can see. So watch the rendered chat, including messages from before
+    // the panel was injected.
+    var domTimer = 0;
+    function scanPageText() {
+      try {
+        var q = parseQuotaText(document.body ? document.body.innerText : '');
+        if (q) reportHit(q.model, q.reset);
+      } catch (e) { /* ignore */ }
+    }
+    function queuePageScan() {
+      if (domTimer) return;
+      domTimer = setTimeout(function () { domTimer = 0; scanPageText(); }, 700);
+    }
+    try {
+      new MutationObserver(queuePageScan).observe(document.body, {
+        childList: true, subtree: true, characterData: true
+      });
+    } catch (e) { /* ignore */ }
+    setTimeout(scanPageText, 2000);
+    setTimeout(scanPageText, 7000);
   })();
 
   send({ cmd: 'hello' });
