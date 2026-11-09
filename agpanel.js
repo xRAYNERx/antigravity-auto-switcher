@@ -17,6 +17,7 @@ const AG_DATA = path.join(APPDATA, 'Antigravity');
 const SW_DATA = path.join(APPDATA, 'AntigravitySwitcher');
 const ACCOUNTS_FILE = path.join(SW_DATA, 'accounts.json');
 const CACHE_FILE = path.join(SW_DATA, 'panel_cache.json');
+const IMAGE_QUOTA_FILE = path.join(SW_DATA, 'image_quota.json');
 const LOG_FILE = path.join(SW_DATA, 'panel.log');
 const LOCK_FILE = path.join(SW_DATA, 'panel.pid');
 const UI_FILE = path.join(__dirname, 'ui.js');
@@ -52,6 +53,7 @@ const state = {
   updateBusy: false,
   updateProgress: 0,
   updateError: '',
+  imageQuota: null,
 };
 
 let cdp = null;
@@ -89,6 +91,20 @@ function loadCache() {
   const c = readJson(CACHE_FILE, { accounts: {} });
   if (!c.accounts) c.accounts = {};
   return c;
+}
+
+function loadImageQuota() {
+  const q = readJson(IMAGE_QUOTA_FILE, null);
+  if (!q || !q.reset) return null;
+  if (Date.parse(q.reset) <= Date.now()) return null;
+  return q;
+}
+
+function saveImageQuota(q) {
+  try {
+    if (q) writeJson(IMAGE_QUOTA_FILE, q);
+    else if (fs.existsSync(IMAGE_QUOTA_FILE)) fs.unlinkSync(IMAGE_QUOTA_FILE);
+  } catch (e) { /* ignore */ }
 }
 
 function saveCache(c) {
@@ -821,6 +837,13 @@ async function handleCommand(raw) {
     await doSwitch(msg.email, false);
   } else if (msg.cmd === 'update') {
     await doUpdate();
+  } else if (msg.cmd === 'imageQuota') {
+    const reset = String(msg.reset || '');
+    if (!reset || Date.parse(reset) <= Date.now()) return;
+    state.imageQuota = { model: String(msg.model || ''), reset: reset, at: Date.now() };
+    saveImageQuota(state.imageQuota);
+    log('image quota exhausted for', state.imageQuota.model, 'until', reset);
+    await pushState();
   }
 }
 
@@ -911,6 +934,11 @@ async function doSwitch(email, auto) {
 
 async function refreshAll() {
   if (busy) return;
+  if (state.imageQuota && Date.parse(state.imageQuota.reset) <= Date.now()) {
+    state.imageQuota = null;
+    saveImageQuota(null);
+    await pushState();
+  }
   try {
     const lsOk = await buildStateBase();
     await pushState();
@@ -1001,6 +1029,7 @@ async function main() {
   });
 
   log('daemon start');
+  state.imageQuota = loadImageQuota();
   await tick();
 
   // after a self-update the window still runs the old UI; reload it once

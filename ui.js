@@ -106,6 +106,11 @@
     '.update .ub:hover{background:color-mix(in srgb, var(--agp-primary) 26%, transparent)}',
     '.update .ub:disabled{opacity:.7;cursor:default}',
     '.update .ue{font-size:10px;color:#FF6E6E;margin-top:3px}',
+    '.qbar{display:none;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--agp-border);',
+    ' background:color-mix(in srgb, #F1FA8C 8%, transparent);font-size:11px;line-height:1.35;color:var(--agp-fg)}',
+    '.qbar.show{display:flex}',
+    '.qbar b{color:var(--agp-fg);font-weight:600}',
+    '.qbar .qi{flex:0 0 auto;font-size:13px;line-height:1;opacity:.85}',
     '.sortbtn{display:flex;align-items:center;gap:3px;height:21px;padding:0 6px;border-radius:6px;',
     ' border:1px solid var(--agp-border);background:transparent;color:var(--agp-muted);font-size:10px;cursor:pointer}',
     '.sortbtn:hover{color:var(--agp-fg);background:var(--agp-hover)}',
@@ -218,6 +223,16 @@
   updateBar.className = 'update';
   updateBar.innerHTML = '<div class="ut" id="ut"></div><button class="ub" id="ub">Обновить</button>';
 
+  var quotaBar = document.createElement('div');
+  quotaBar.className = 'qbar';
+  quotaBar.innerHTML =
+    '<svg class="qi" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">' +
+    '<rect x="1.5" y="2.5" width="13" height="11" rx="2"/>' +
+    '<circle cx="5.4" cy="6.2" r="1.1"/>' +
+    '<path d="M2.6 11.6l3.4-3.1 2.5 2.2 2.3-1.9 2.6 2.4"/></svg>' +
+    '<span id="qt"></span>';
+
   var list = document.createElement('div');
   list.className = 'list';
 
@@ -232,6 +247,7 @@
 
   card.appendChild(head);
   card.appendChild(updateBar);
+  card.appendChild(quotaBar);
   card.appendChild(list);
   card.appendChild(note);
   wrap.appendChild(card);
@@ -415,6 +431,21 @@
     } else {
       updateBar.classList.remove('show');
     }
+
+    var qt = root.getElementById('qt');
+    var iq = current.imageQuota;
+    if (iq && iq.reset && Date.parse(iq.reset) > Date.now()) {
+      quotaBar.classList.add('show');
+      var leftMin = Math.max(0, Math.round((Date.parse(iq.reset) - Date.now()) / 60000));
+      var hh = Math.floor(leftMin / 60);
+      var mm = leftMin % 60;
+      var leftTxt = hh > 0 ? hh + 'ч' + (mm ? ' ' + mm + 'м' : '') : mm + 'м';
+      var d = new Date(iq.reset);
+      var clock = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+      qt.innerHTML = 'Картинки: лимит исчерпан · восстановится через <b>' + leftTxt + '</b> (' + clock + ')';
+    } else {
+      quotaBar.classList.remove('show');
+    }
   }
 
   function update(next) {
@@ -499,5 +530,84 @@
   };
 
   render();
+  window.__agSwitcherQuotaHit = function (model, reset) {
+    send({ cmd: 'imageQuota', model: model, reset: reset });
+  };
+
+  (function () {
+    if (window.__agQuotaHooks) return;
+    window.__agQuotaHooks = true;
+
+    function scan(txt) {
+      if (!txt || txt.indexOf('quotaResetTimeStamp') === -1) return;
+      var re = /"metadata"\s*:\s*\{[^}]*\}/g;
+      var m;
+      while ((m = re.exec(txt))) {
+        var block = m[0];
+        var model = (block.match(/"model"\s*:\s*"([^"]+)"/) || [])[1] || '';
+        var reset = (block.match(/"quotaResetTimeStamp"\s*:\s*"([^"]+)"/) || [])[1] || '';
+        if (model && reset && /image/i.test(model)) {
+          try { window.__agSwitcherQuotaHit(model, reset); } catch (e) { /* ignore */ }
+        }
+      }
+    }
+
+    var origFetch = window.fetch;
+    if (origFetch) {
+      window.fetch = function () {
+        var p = origFetch.apply(this, arguments);
+        try {
+          p.then(function (res) {
+            try {
+              var url = String(res.url || '');
+              if (url.indexOf('LanguageServerService') === -1) return res;
+              if (!/Cascade|Stream|Agent/i.test(url)) return res;
+              var clone = res.clone();
+              if (!clone.body) return res;
+              var reader = clone.body.getReader();
+              var dec = new TextDecoder();
+              var buf = '';
+              var total = 0;
+              (function pump() {
+                reader.read().then(function (r) {
+                  if (r.done) return;
+                  total += r.value.length;
+                  if (total > 3 * 1024 * 1024) {
+                    try { reader.cancel(); } catch (e) { /* ignore */ }
+                    return;
+                  }
+                  buf += dec.decode(r.value, { stream: true });
+                  scan(buf);
+                  if (buf.length > 120000) buf = buf.slice(-60000);
+                  pump();
+                }).catch(function () {});
+              })();
+            } catch (e) { /* ignore */ }
+            return res;
+          }).catch(function () {});
+        } catch (e) { /* ignore */ }
+        return p;
+      };
+    }
+
+    var OrigWS = window.WebSocket;
+    if (OrigWS) {
+      function PatchedWS(url, protocols) {
+        var ws = new OrigWS(url, protocols);
+        try {
+          ws.addEventListener('message', function (ev) {
+            if (typeof ev.data === 'string') scan(ev.data);
+          });
+        } catch (e) { /* ignore */ }
+        return ws;
+      }
+      PatchedWS.prototype = OrigWS.prototype;
+      ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) {
+        try { PatchedWS[k] = OrigWS[k]; } catch (e) { /* ignore */ }
+      });
+      window.WebSocket = PatchedWS;
+    }
+  })();
+
   send({ cmd: 'hello' });
 })();
